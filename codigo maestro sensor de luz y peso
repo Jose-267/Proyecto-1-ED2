@@ -1,0 +1,143 @@
+/*
+ * Proyecto1Maestro1.c
+ * ---------------------------------------------------------
+ * Descripción: 
+ * 1. Lee sensor de Luz (BH1750) localmente y lo convierte a %.
+ * 2. Pide el peso a un Arduino Esclavo (0x30) por I2C.
+ * 3. Muestra ambos valores en una LCD 16x2.
+ * ---------------------------------------------------------
+ */
+
+#define F_CPU 16000000UL // Velocidad del reloj (16MHz)
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdlib.h>      // Necesaria para 'itoa' (convertir números a texto)
+
+// Librerías propias
+#include "i2c.h"
+#include "BH1750.h"
+#include "lcd_8bit.h"
+
+// --- CONFIGURACIÓN I2C ---
+#define slaveUS1 0x30                  // Dirección base del esclavo (7 bits)
+#define slaveUS1R ((0x30 << 1) | 0x01) // Dirección + Bit de Lectura (1)
+#define slaveUS1W ((0x30 << 1) & 0xFE) // Dirección + Bit de Escritura (0)
+
+// --- CONFIGURACIÓN SENSORES ---
+#define MAX_LUX 2000     // Valor de lux que consideramos el 100% de luz
+
+// --- VARIABLES ---
+uint8_t bufferI2C = 0;   // Dato comprimido recibido del esclavo
+uint16_t pasoFinal;      // Peso real calculado (descomprimido)
+char bufferTexto[10];    // Buffer para texto del peso
+char bufferDisp[10];     // Buffer para texto de la luz
+
+// Prototipo de función auxiliar
+uint8_t obtenerPorcentajeLuz(void);
+
+int main(void)
+{
+    // --- 1. CONFIGURACIÓN DE PUERTOS ---
+    // PD2 a PD7 como salidas (Para LCD y control)
+    DDRD |= 0xFC; 
+    // PB0 y PB1 como salidas
+    DDRB |= 0x03; 
+
+    // --- 2. INICIALIZACIÓN DE MÓDULOS ---
+    I2C_Master_Init(100000, 1); // Iniciar I2C a 100kHz
+    LCD_Inicializar();          // Iniciar LCD 8 bits
+    BH1750_Init();              // Iniciar sensor de luz local
+    
+    LCD_Comando(0x01); // Limpiar pantalla completamente
+    _delay_ms(20);
+    
+    // --- 3. INTERFAZ GRÁFICA FIJA ---
+    // Escribimos los títulos una sola vez para no parpadear
+    LCD_Posicion(0, 0); LCD_Mensaje("Luz:");
+    LCD_Posicion(0, 6); LCD_Mensaje("Peso:");
+    LCD_Posicion(0, 12); LCD_Mensaje("Prx:"); // "Proximidad" abreviado
+
+    // --- 4. BUCLE INFINITO ---
+    while (1)
+    {
+        // ============================================================
+        // BLOQUE A: LEER PESO DEL ESCLAVO (I2C)
+        // ============================================================
+        
+        // Paso 1: Iniciar comunicación (Start Condition)
+        // Usamos 'continue' si falla para no trabar el programa
+        if(!I2C_Master_Start()) continue;
+
+        // Paso 2: Seleccionar Esclavo en modo ESCRITURA
+        if (!I2C_Master_Write(slaveUS1W)) {
+            I2C_Master_Stop(); // Si nadie responde, liberar bus
+            continue;          // Reintentar en la siguiente vuelta
+        }
+        
+        // Paso 3: Mandar comando 'P' (Pedir Peso)
+        I2C_Master_Write('P'); 
+        _delay_ms(5); // Pequeña pausa para que el esclavo procese
+
+        // Paso 4: Reiniciar comunicación (Repeated Start) para cambiar a modo LECTURA
+        if (!I2C_Master_Repeated_Start()) {
+            I2C_Master_Stop();
+            continue;
+        }
+
+        // Paso 5: Seleccionar Esclavo en modo LECTURA
+        if (!I2C_Master_Write(slaveUS1R)) {
+            I2C_Master_Stop();
+            continue;
+        }
+
+        // Paso 6: Leer 1 byte del esclavo
+        // El '0' (NACK) indica que es el último dato y cortamos comunicación
+        I2C_Master_Read(&bufferI2C, 0); 
+        I2C_Master_Stop(); // Fin de la transmisión I2C
+        
+        // --- PROCESAMIENTO DEL DATO ---
+        // El esclavo envió el peso dividido por 4 para que cupiera en 1 byte.
+        // Aquí multiplicamos por 4 para recuperar el valor real en gramos.
+        pasoFinal = (uint16_t)bufferI2C * 4;
+        
+        // Convertir numero a texto (decimal)
+        itoa(pasoFinal, bufferTexto, 10);
+        
+        // Mostrar en LCD (Fila 1, Columna 6)
+        LCD_Posicion(1, 6);
+        LCD_Mensaje(bufferTexto);
+        LCD_Mensaje("g  "); // Agregamos 'g' y espacios para borrar sobrantes
+
+        // ============================================================
+        // BLOQUE B: LEER SENSOR DE LUZ LOCAL (BH1750)
+        // ============================================================
+        
+        uint8_t porcentaje = obtenerPorcentajeLuz();    
+        
+        itoa(porcentaje, bufferDisp, 10);
+        
+        // Mostrar en LCD (Fila 1, Columna 0)
+        LCD_Posicion(1, 0); 
+        LCD_Mensaje(bufferDisp);
+        LCD_Mensaje("%   "); // Símbolo % y espacios de limpieza
+        
+        _delay_ms(500); // Actualizar pantalla cada medio segundo
+    }
+}
+
+// --- FUNCIONES AUXILIARES ---
+
+// Función para leer Lux y convertir a escala 0-100%
+uint8_t obtenerPorcentajeLuz(void)
+{
+    // Leer valor crudo (0 a 65535)
+    uint16_t lecturaRaw = BH1750_ReadLux();
+    
+    // Saturación: Si hay más luz que el máximo, limitar a 100%
+    if (lecturaRaw >= MAX_LUX) return 100;
+
+    // Regla de tres simple: (Lectura * 100) / Maximo
+    // Usamos uint32_t para evitar desbordamiento matemático intermedio
+    return (uint8_t)((uint32_t)lecturaRaw * 100 / MAX_LUX);
+}
